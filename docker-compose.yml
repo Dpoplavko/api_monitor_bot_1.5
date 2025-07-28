@@ -1,0 +1,14 @@
+# docker-compose.yml
+# Файл для оркестрації (запуску) наших контейнерів
+
+version: '3.8'
+
+services:
+  bot:
+    build: .
+    container_name: api_monitor_bot
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./db.sqlite3:/app/db.sqlite3

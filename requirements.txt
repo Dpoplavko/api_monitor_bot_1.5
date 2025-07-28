@@ -1,0 +1,12 @@
+# requirements.txt
+# Список Python-залежностей для нашого проєкту
+
+aiogram==3.5.0
+apscheduler==3.10.4
+httpx==0.27.0
+sqlalchemy==2.0.30
+aiosqlite==0.20.0
+python-dotenv==1.0.1
+matplotlib==3.8.4
+# Додайте наступний рядок, якщо плануєте використовувати PostgreSQL
+# asyncpg==0.29.0
