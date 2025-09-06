@@ -1,8 +1,6 @@
 # docker-compose.yml
 # Файл для оркестрації (запуску) наших контейнерів
 
-version: '3.8'
-
 services:
   bot:
     build: .
@@ -10,5 +8,13 @@ services:
     restart: always
     env_file:
       - .env
+    environment:
+      - TZ=${TZ:-UTC}
     volumes:
-      - ./db.sqlite3:/app/db.sqlite3
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; print('ok')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

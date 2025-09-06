@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pytest_cache/
+.venv/
+.env
+.git/
+.gitignore
+.vscode/
+.idea/
+*.log
+node_modules/
+*.ipynb_checkpoints/
+# host data dirs should be mounted, not copied
+/data/
+/db.sqlite3/

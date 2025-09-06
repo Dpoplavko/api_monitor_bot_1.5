@@ -3,10 +3,10 @@
 
 import datetime
 import logging
-from typing import AsyncGenerator, List, Optional, Tuple
+from typing import AsyncGenerator, List, Optional, Tuple, Dict
 
 from sqlalchemy import (Column, Integer, String, DateTime, Boolean, JSON,
-                        create_engine, select, func, ForeignKey)
+                        create_engine, select, func, ForeignKey, Index)
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship
 
@@ -15,7 +15,7 @@ from utils import parse_period_to_timedelta
 
 logger = logging.getLogger(__name__)
 
-DB_URL = settings.DATABASE_URL or "sqlite+aiosqlite:///./db.sqlite3"
+DB_URL = settings.DATABASE_URL or "sqlite+aiosqlite:///./data/db.sqlite3"
 IS_POSTGRES = DB_URL.startswith("postgresql")
 
 engine_args = {"connect_args": {"check_same_thread": False}} if not IS_POSTGRES else {}
@@ -58,6 +58,9 @@ class CheckHistory(Base):
     is_ok = Column(Boolean, nullable=False)
     response_time_ms = Column(Integer, nullable=True)
     status_code = Column(Integer, nullable=True)
+    __table_args__ = (
+        Index('ix_check_history_api_id_timestamp', 'api_id', 'timestamp'),
+    )
 
 class Incident(Base):
     __tablename__ = "incidents"
@@ -65,6 +68,47 @@ class Incident(Base):
     api_id = Column(Integer, ForeignKey("monitored_apis.id", ondelete="CASCADE"), nullable=False)
     start_time = Column(DateTime, nullable=False, index=True)
     end_time = Column(DateTime, nullable=True, index=True)
+
+class MLMetric(Base):
+    __tablename__ = "ml_metrics"
+    id = Column(Integer, primary_key=True)
+    api_id = Column(Integer, ForeignKey("monitored_apis.id", ondelete="CASCADE"), nullable=False, index=True)
+    computed_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+    window_size = Column(Integer, default=200)
+    median_ms = Column(Integer, nullable=True)
+    mad_ms = Column(Integer, nullable=True)
+    ewma_ms = Column(Integer, nullable=True)
+    ucl_ms = Column(Integer, nullable=True)  # Upper Control Limit
+
+class AnomalyEvent(Base):
+    __tablename__ = "anomaly_events"
+    id = Column(Integer, primary_key=True)
+    api_id = Column(Integer, ForeignKey("monitored_apis.id", ondelete="CASCADE"), nullable=False, index=True)
+    timestamp = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+    response_time_ms = Column(Integer, nullable=False)
+    score = Column(Integer, nullable=True)
+    reason = Column(String, nullable=True)
+
+class Subscription(Base):
+    __tablename__ = "subscriptions"
+    id = Column(Integer, primary_key=True)
+    chat_id = Column(Integer, index=True, nullable=False)
+    api_id = Column(Integer, ForeignKey("monitored_apis.id", ondelete="CASCADE"), nullable=True, index=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    __table_args__ = (
+        Index('ux_subscription_chat_api', 'chat_id', 'api_id', unique=True),
+    )
+
+class NotificationState(Base):
+    __tablename__ = "notification_state"
+    id = Column(Integer, primary_key=True)
+    api_id = Column(Integer, ForeignKey("monitored_apis.id", ondelete="CASCADE"), nullable=False, index=True)
+    last_down_reminder_at = Column(DateTime, nullable=True)
+
+class AppConfig(Base):
+    __tablename__ = "app_config"
+    key = Column(String, primary_key=True)
+    value = Column(String, nullable=True)
 
 async def init_db():
     async with async_engine.begin() as conn:
@@ -186,3 +230,115 @@ async def get_stats_for_period(api_id: int, period: str) -> dict:
         "period": period, "uptime_percent": uptime, "avg_response_time_ms": avg_response_time,
         "incident_count": incident_count, "total_downtime": total_downtime, "avg_downtime": avg_downtime,
     }
+
+# --- ML helpers ---
+async def get_recent_history_points(api_id: int, limit: int = 200) -> List[CheckHistory]:
+    async with AsyncSessionFactory() as session:
+        stmt = select(CheckHistory).where(CheckHistory.api_id == api_id).order_by(CheckHistory.timestamp.desc()).limit(limit)
+        rows = (await session.execute(stmt)).scalars().all()
+        rows.reverse()
+        return rows
+
+async def save_ml_metric(api_id: int, metrics: dict) -> MLMetric:
+    async with AsyncSessionFactory() as session:
+        rec = MLMetric(api_id=api_id, **metrics)
+        session.add(rec)
+        await session.commit()
+        await session.refresh(rec)
+        return rec
+
+async def get_latest_ml_metric(api_id: int) -> Optional[MLMetric]:
+    async with AsyncSessionFactory() as session:
+        stmt = select(MLMetric).where(MLMetric.api_id == api_id).order_by(MLMetric.computed_at.desc()).limit(1)
+        return (await session.execute(stmt)).scalars().first()
+
+async def log_anomaly_event(api_id: int, response_time_ms: int, score: float, reason: str):
+    async with AsyncSessionFactory() as session:
+        rec = AnomalyEvent(api_id=api_id, response_time_ms=response_time_ms, score=int(score), reason=reason)
+        session.add(rec)
+        await session.commit()
+
+async def get_last_anomaly_time(api_id: int) -> Optional[datetime.datetime]:
+    async with AsyncSessionFactory() as session:
+        stmt = select(AnomalyEvent).where(AnomalyEvent.api_id == api_id).order_by(AnomalyEvent.timestamp.desc()).limit(1)
+        last = (await session.execute(stmt)).scalars().first()
+        return last.timestamp if last else None
+
+async def subscribe_chat(chat_id: int, api_id: Optional[int] = None) -> bool:
+    async with AsyncSessionFactory() as session:
+        # prevent duplicates via unique index; ignore if exists
+        try:
+            sub = Subscription(chat_id=chat_id, api_id=api_id)
+            session.add(sub)
+            await session.commit()
+            return True
+        except Exception:
+            await session.rollback()
+            return False
+
+async def unsubscribe_chat(chat_id: int, api_id: Optional[int] = None) -> bool:
+    async with AsyncSessionFactory() as session:
+        stmt = select(Subscription).where(Subscription.chat_id == chat_id)
+        if api_id is None:
+            stmt = stmt.where(Subscription.api_id.is_(None))
+        else:
+            stmt = stmt.where(Subscription.api_id == api_id)
+        rec = (await session.execute(stmt)).scalars().first()
+        if rec:
+            await session.delete(rec)
+            await session.commit()
+            return True
+        return False
+
+async def get_subscribers_for_api(api_id: int) -> List[int]:
+    async with AsyncSessionFactory() as session:
+        global_stmt = select(Subscription.chat_id).where(Subscription.api_id.is_(None))
+        api_stmt = select(Subscription.chat_id).where(Subscription.api_id == api_id)
+        globals_list = [row[0] for row in (await session.execute(global_stmt)).all()]
+        api_list = [row[0] for row in (await session.execute(api_stmt)).all()]
+        # Always include admin
+        result = set(globals_list + api_list + [int(settings.ADMIN_USER_ID)])
+        return list(result)
+
+async def get_or_create_notification_state(api_id: int) -> NotificationState:
+    async with AsyncSessionFactory() as session:
+        stmt = select(NotificationState).where(NotificationState.api_id == api_id)
+        rec = (await session.execute(stmt)).scalars().first()
+        if not rec:
+            rec = NotificationState(api_id=api_id)
+            session.add(rec)
+            await session.commit()
+            await session.refresh(rec)
+        return rec
+
+async def update_down_reminder_time(api_id: int, ts: datetime.datetime):
+    async with AsyncSessionFactory() as session:
+        stmt = select(NotificationState).where(NotificationState.api_id == api_id)
+        rec = (await session.execute(stmt)).scalars().first()
+        if not rec:
+            rec = NotificationState(api_id=api_id, last_down_reminder_at=ts)
+            session.add(rec)
+        else:
+            rec.last_down_reminder_at = ts
+        await session.commit()
+
+# --- Runtime App Config ---
+async def get_config_value(key: str) -> Optional[str]:
+    async with AsyncSessionFactory() as session:
+        rec = (await session.execute(select(AppConfig).where(AppConfig.key == key))).scalars().first()
+        return rec.value if rec else None
+
+async def set_config_value(key: str, value: Optional[str]) -> None:
+    async with AsyncSessionFactory() as session:
+        rec = (await session.execute(select(AppConfig).where(AppConfig.key == key))).scalars().first()
+        if rec:
+            rec.value = value
+        else:
+            rec = AppConfig(key=key, value=value)
+            session.add(rec)
+        await session.commit()
+
+async def get_all_config() -> Dict[str, str]:
+    async with AsyncSessionFactory() as session:
+        rows = (await session.execute(select(AppConfig))).scalars().all()
+        return {r.key: r.value for r in rows}

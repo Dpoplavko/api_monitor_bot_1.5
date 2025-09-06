@@ -14,11 +14,10 @@ if ! command -v docker &> /dev/null; then
     sudo usermod -aG docker $USER
 fi
 
-# Встановлення Docker Compose, якщо не встановлений
-if ! command -v docker-compose &> /dev/null; then
-    echo "Встановлення Docker Compose..."
-    sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-    sudo chmod +x /usr/local/bin/docker-compose
+# Перевірка docker compose (плагін)
+if ! docker compose version &> /dev/null; then
+    echo "Встановлення Docker Compose Plugin..."
+    sudo apt-get update && sudo apt-get install -y docker-compose-plugin
 fi
 
 # Клонування або оновлення репозиторію
@@ -43,10 +42,10 @@ if [ ! -f .env ]; then
 fi
 
 # Зупинка старих контейнерів
-docker-compose down
+docker compose down
 
 # Збірка та запуск
-docker-compose up --build -d
+docker compose up --build -d
 
 echo "✅ Деплой завершено!"
-echo "Перевірте статус: docker-compose logs -f"
+echo "Перевірте статус: docker compose logs -f"

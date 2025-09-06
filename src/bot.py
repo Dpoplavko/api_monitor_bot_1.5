@@ -6,6 +6,7 @@ import logging
 
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -28,14 +29,17 @@ async def main():
 
     # Ініціалізація бота та диспетчера
     storage = MemoryStorage()
-    bot = Bot(token=settings.BOT_TOKEN, parse_mode=ParseMode.HTML)
+    bot = Bot(token=settings.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=storage)
 
     # Підключення роутера з обробниками команд
     dp.include_router(router)
 
     # Ініціалізація планувальника завдань
-    scheduler = AsyncIOScheduler(timezone="Europe/Kiev")
+    scheduler = AsyncIOScheduler(timezone=settings.TZ, job_defaults={
+        "max_instances": 1,
+        "misfire_grace_time": 30
+    })
     
     # Передача залежностей (bot, scheduler) у диспетчер
     dp["bot"] = bot

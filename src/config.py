@@ -18,6 +18,40 @@ class Settings:
     DATABASE_URL: str | None 
     FAILURE_THRESHOLD: int
     RECOVERY_THRESHOLD: int
+    # Optional/advanced
+    TZ: str | None = None
+    REPORT_HOUR: int = 9
+    REPORT_MINUTE: int = 0
+    REQUEST_RETRIES: int = 1
+    REQUEST_BACKOFF: float = 0.5
+    # ML / anomaly detection
+    ML_ENABLED: int = 1
+    ML_WINDOW: int = 200
+    ML_COMPUTE_INTERVAL_MINUTES: int = 10
+    ANOMALY_COOLDOWN_MINUTES: int = 30
+    # Quiet hours & reminders
+    QUIET_HOURS_ENABLED: int = 0
+    QUIET_START_HOUR: int = 22
+    QUIET_END_HOUR: int = 8
+    DOWNTIME_REMINDER_MINUTES: int = 60
+    # Charts / visualization
+    CHART_STYLE: str | None = None
+    CHART_Y_SCALE: str = "log"  # log|linear|auto
+    CHART_SHOW_UCL: int = 1
+    CHART_SHOW_EWMA: int = 1
+    CHART_EWMA_ALPHA: float = 0.3
+    CHART_SHOW_PERCENTILES: str = "50,90,95"
+    CHART_MARK_FAILURES: int = 1
+    # Downsampling & point rendering
+    CHART_POINT_EVERY: int = 5  # показувати кожну N-ту точку успішних пінгів
+    CHART_MARK_ANOMALIES: int = 1  # завжди показувати точки-аномалії поверх даунсемплінгу
+    CHART_SHOW_RAW_LINE: int = 1  # показувати «сиру» лінію з усіх значень
+    # Aggregation / downsampling strategy: none | per_minute | lttb
+    CHART_AGGREGATION: str = "per_minute"
+    CHART_AGG_PERCENTILE: int = 95  # для перехресної лінії в агрегації (P95)
+    CHART_LTTB_POINTS: int = 240  # цільова кількість точок для LTTB
+    CHART_SIZE: str = "12x6.5"
+    CHART_DPI: int = 120
 
     def __post_init__(self):
         # Перевірка, що обов'язкові змінні існують
@@ -36,10 +70,42 @@ class Settings:
 
 # Створюємо екземпляр налаштувань
 settings = Settings(
-    BOT_TOKEN=os.getenv("BOT_TOKEN"),
-    ADMIN_USER_ID=os.getenv("ADMIN_USER_ID"),
+    BOT_TOKEN=os.getenv("BOT_TOKEN", ""),
+    ADMIN_USER_ID=int(os.getenv("ADMIN_USER_ID", "0")),
     DATABASE_URL=os.getenv("DATABASE_URL"),
     # Встановлюємо значення за замовчуванням, якщо вони не вказані в .env
     FAILURE_THRESHOLD=int(os.getenv("FAILURE_THRESHOLD", 3)),
-    RECOVERY_THRESHOLD=int(os.getenv("RECOVERY_THRESHOLD", 2))
+    RECOVERY_THRESHOLD=int(os.getenv("RECOVERY_THRESHOLD", 2)),
+    TZ=os.getenv("TZ", "UTC"),
+    REPORT_HOUR=int(os.getenv("REPORT_HOUR", "9")),
+    REPORT_MINUTE=int(os.getenv("REPORT_MINUTE", "0")),
+    REQUEST_RETRIES=int(os.getenv("REQUEST_RETRIES", "1")),
+    REQUEST_BACKOFF=float(os.getenv("REQUEST_BACKOFF", "0.5")),
+    ML_ENABLED=(
+        1 if str(os.getenv("ML_ENABLED", "1")).strip().lower() in {"1","true","yes","y","on","t"} else 0
+    ),
+    ML_WINDOW=int(os.getenv("ML_WINDOW", "200")),
+    ML_COMPUTE_INTERVAL_MINUTES=int(os.getenv("ML_COMPUTE_INTERVAL_MINUTES", "10")),
+    ANOMALY_COOLDOWN_MINUTES=int(os.getenv("ANOMALY_COOLDOWN_MINUTES", "30")),
+    QUIET_HOURS_ENABLED=(
+        1 if str(os.getenv("QUIET_HOURS_ENABLED", "0")).strip().lower() in {"1","true","yes","y","on","t"} else 0
+    ),
+    QUIET_START_HOUR=int(os.getenv("QUIET_START_HOUR", "22")),
+    QUIET_END_HOUR=int(os.getenv("QUIET_END_HOUR", "8")),
+    DOWNTIME_REMINDER_MINUTES=int(os.getenv("DOWNTIME_REMINDER_MINUTES", "60")),
+    CHART_STYLE=os.getenv("CHART_STYLE", "seaborn-v0_8-darkgrid"),
+    CHART_Y_SCALE=os.getenv("CHART_Y_SCALE", "log"),
+    CHART_SHOW_UCL=(1 if str(os.getenv("CHART_SHOW_UCL", "1")).strip().lower() in {"1","true","yes","y","on","t"} else 0),
+    CHART_SHOW_EWMA=(1 if str(os.getenv("CHART_SHOW_EWMA", "1")).strip().lower() in {"1","true","yes","y","on","t"} else 0),
+    CHART_EWMA_ALPHA=float(os.getenv("CHART_EWMA_ALPHA", "0.3")),
+    CHART_SHOW_PERCENTILES=os.getenv("CHART_SHOW_PERCENTILES", "50,90,95"),
+    CHART_MARK_FAILURES=(1 if str(os.getenv("CHART_MARK_FAILURES", "1")).strip().lower() in {"1","true","yes","y","on","t"} else 0),
+    CHART_POINT_EVERY=int(os.getenv("CHART_POINT_EVERY", "5")),
+    CHART_MARK_ANOMALIES=(1 if str(os.getenv("CHART_MARK_ANOMALIES", "1")).strip().lower() in {"1","true","yes","y","on","t"} else 0),
+    CHART_SHOW_RAW_LINE=(1 if str(os.getenv("CHART_SHOW_RAW_LINE", "1")).strip().lower() in {"1","true","yes","y","on","t"} else 0),
+    CHART_AGGREGATION=os.getenv("CHART_AGGREGATION", "per_minute"),
+    CHART_AGG_PERCENTILE=int(os.getenv("CHART_AGG_PERCENTILE", "95")),
+    CHART_LTTB_POINTS=int(os.getenv("CHART_LTTB_POINTS", "240")),
+    CHART_SIZE=os.getenv("CHART_SIZE", "12x6.5"),
+    CHART_DPI=int(os.getenv("CHART_DPI", "120")),
 )
