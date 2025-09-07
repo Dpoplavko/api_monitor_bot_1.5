@@ -23,6 +23,7 @@ from utils import (format_api_status, parse_add_command, format_statistics_repor
                    generate_statistics_chart)  # type: ignore
 from runtime_config import get_chart_overrides, set_chart_option, get_effective_chart_config_sync
 from version import VERSION, RELEASE_NOTES
+from sysmon import format_server_status  # type: ignore
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -158,6 +159,9 @@ def build_main_menu(is_sub: bool, is_admin: bool = False, anom_on: bool = True) 
     else:
         rows.append([InlineKeyboardButton(text="🔔 Підписатися на всі", callback_data="sub_all")])
     rows.append([InlineKeyboardButton(text=("⚠️ Аномалії для мене: ON" if anom_on else "⚠️ Аномалії для мене: OFF"), callback_data="toggle_user_anom")])
+    if is_admin:
+        rows.append([InlineKeyboardButton(text="🖥️ Статус сервера", callback_data="server_status")])
+        rows.append([InlineKeyboardButton(text="📡 Metrics health", callback_data="metrics_health")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def build_api_panel(api: Any, chat_id: Optional[int], user_id: int | None = None) -> InlineKeyboardMarkup:
@@ -165,6 +169,7 @@ def build_api_panel(api: Any, chat_id: Optional[int], user_id: int | None = None
     # state toggles
     pause_btn = InlineKeyboardButton(text=("⏸️ Пауза" if api.is_active else "▶️ Відновити"), callback_data=(f"pause:{api.id}" if api.is_active else f"resume:{api.id}"))
     stats_btn = InlineKeyboardButton(text="📊 24h", callback_data=f"stats:{api.id}:24h")
+    stats1h_btn = InlineKeyboardButton(text="1h", callback_data=f"stats:{api.id}:1h")
     stats6_btn = InlineKeyboardButton(text="6h", callback_data=f"stats:{api.id}:6h")
     stats7d_btn = InlineKeyboardButton(text="7d", callback_data=f"stats:{api.id}:7d")
     stats30d_btn = InlineKeyboardButton(text="30d", callback_data=f"stats:{api.id}:30d")
@@ -192,7 +197,7 @@ def build_api_panel(api: Any, chat_id: Optional[int], user_id: int | None = None
     home_btn = InlineKeyboardButton(text="🏠 Меню", callback_data="menu")
 
     check_now_btn = InlineKeyboardButton(text="🔄 Перевірити зараз", callback_data=f"check:{api.id}")
-    rows = [[stats6_btn, stats_btn, stats7d_btn, stats30d_btn]]
+    rows = [[stats1h_btn, stats6_btn, stats_btn, stats7d_btn, stats30d_btn]]
     if is_admin:
         rows += [
             [pause_btn, check_now_btn],
@@ -320,6 +325,90 @@ async def cb_list_apis(call: CallbackQuery):
     kb_rows.append([InlineKeyboardButton(text="⬅️ Меню", callback_data="menu")])
     await _safe_edit_text(call, "Оберіть монітор:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
     await call.answer()
+
+@router.callback_query(F.data == "server_status")
+async def cb_server_status(call: CallbackQuery):
+    if not await _guard_callback_access(call):
+        return
+    if getattr(call.from_user, 'id', None) != settings.ADMIN_USER_ID:
+        await call.answer("Тільки адмін", show_alert=True)
+        return
+    # Optional service health: try to fetch metrics endpoint
+    health_line = None
+    try:
+        import os
+        import httpx  # type: ignore
+        port = int(os.getenv("METRICS_PORT", "8080"))
+        url = f"http://127.0.0.1:{port}/"
+        async with httpx.AsyncClient(timeout=1.0) as client:  # type: ignore
+            r = await client.get(url)
+            if r.status_code == 200:
+                health_line = "✅ Сервіс (metrics) відповідає"
+            else:
+                health_line = f"⚠️ Сервіс (metrics) статус: {r.status_code}"
+    except Exception:
+        health_line = "⚠️ Сервіс (metrics) недоступний"
+    text = await format_server_status(health_line)
+    await _safe_edit_text(call, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Меню", callback_data="menu")]]))
+    try:
+        await call.answer()
+    except Exception:
+        pass
+
+@router.message(AdminFilter(), Command("server_status"))
+async def cmd_server_status(message: Message):
+    if not await _guard_message_access(message):
+        return
+    # Metrics endpoint health
+    health_line = None
+    try:
+        import os
+        import httpx  # type: ignore
+        port = int(os.getenv("METRICS_PORT", "8080"))
+        url = f"http://127.0.0.1:{port}/"
+        async with httpx.AsyncClient(timeout=1.0) as client:  # type: ignore
+            r = await client.get(url)
+            if r.status_code == 200:
+                health_line = "✅ Сервіс (metrics) відповідає"
+            else:
+                health_line = f"⚠️ Сервіс (metrics) статус: {r.status_code}"
+    except Exception:
+        health_line = "⚠️ Сервіс (metrics) недоступний"
+    text = await format_server_status(health_line)
+    await message.answer(text)
+
+@router.callback_query(F.data == "metrics_health")
+async def cb_metrics_health(call: CallbackQuery):
+    if not await _guard_callback_access(call):
+        return
+    if getattr(call.from_user, 'id', None) != settings.ADMIN_USER_ID:
+        await call.answer("Тільки адмін", show_alert=True)
+        return
+    # Measure latency and status code
+    import os, time
+    try:
+        import httpx  # type: ignore
+        port = int(os.getenv("METRICS_PORT", "8080"))
+        url = f"http://127.0.0.1:{port}/"
+        t0 = time.perf_counter()
+        async with httpx.AsyncClient(timeout=2.0) as client:  # type: ignore
+            r = await client.get(url)
+            dt_ms = int((time.perf_counter() - t0) * 1000)
+            body_snip = (r.text[:200] + '…') if len(r.text) > 200 else r.text
+            text = (
+                f"📡 <b>Metrics health</b>\n"
+                f"URL: {url}\n"
+                f"Status: {r.status_code}\n"
+                f"Latency: {dt_ms} ms\n\n"
+                f"Preview:\n<pre>{body_snip.replace('<', '&lt;')}</pre>"
+            )
+    except Exception as e:
+        text = f"📡 <b>Metrics health</b>\nПомилка: {e}"
+    await _safe_edit_text(call, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Меню", callback_data="menu")]]))
+    try:
+        await call.answer()
+    except Exception:
+        pass
 
 @router.callback_query(F.data == "menu")
 async def cb_menu(call: CallbackQuery):
@@ -989,7 +1078,7 @@ async def cmd_stats(message: Message):
         return
     parts = (message.text or '').split()
     if len(parts) < 2:
-        await message.answer("Вкажіть ID. Приклад: <code>/stats 1 24h</code>")
+        await message.answer("Вкажіть ID. Приклад: <code>/stats 1 1h</code> або <code>/stats 1 24h</code>")
         return
     try:
         api_id = int(parts[1])

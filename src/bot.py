@@ -18,6 +18,7 @@ from handlers import router
 from scheduler import setup_scheduler
 from prometheus_client import start_http_server
 from metrics import BOT_UP
+from sysmon import install_log_capture, set_bot_start
 
 # Prometheus metrics are defined in metrics.py
 
@@ -53,6 +54,13 @@ async def main():
     
     # Передаємо конфігурацію в об'єкт bot для доступу в інших модулях
     bot.config = settings
+
+    # Включаємо збір помилок у пам'яті та фіксуємо час старту бота
+    try:
+        install_log_capture()
+        set_bot_start()
+    except Exception:
+        pass
 
     # Metrics HTTP server (health/metrics)
     def _start_metrics():
