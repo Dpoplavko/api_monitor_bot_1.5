@@ -45,7 +45,7 @@ class Settings:
     # Metrics/health
     METRICS_PORT: int = 8080
     # Charts / visualization
-    CHART_STYLE: str | None = None
+    CHART_STYLE: str | None = "plotly_dark"  # plotly_white / plotly_dark (default: dark)
     CHART_Y_SCALE: str = "log"  # log|linear|auto
     CHART_SHOW_UCL: int = 1
     CHART_SHOW_EWMA: int = 1
@@ -110,7 +110,7 @@ settings = Settings(
     DOWNTIME_REMINDER_MINUTES=int(os.getenv("DOWNTIME_REMINDER_MINUTES", "60")),
     RETENTION_DAYS=int(os.getenv("RETENTION_DAYS", "90")),
     METRICS_PORT=int(os.getenv("METRICS_PORT", "8080")),
-    CHART_STYLE=os.getenv("CHART_STYLE", "seaborn-v0_8-darkgrid"),
+    CHART_STYLE=os.getenv("CHART_STYLE", "plotly_dark"),
     CHART_Y_SCALE=os.getenv("CHART_Y_SCALE", "log"),
     CHART_SHOW_UCL=(1 if str(os.getenv("CHART_SHOW_UCL", "1")).strip().lower() in {"1","true","yes","y","on","t"} else 0),
     CHART_SHOW_EWMA=(1 if str(os.getenv("CHART_SHOW_EWMA", "1")).strip().lower() in {"1","true","yes","y","on","t"} else 0),

@@ -22,11 +22,9 @@ def _effective_chart_config(overrides: Optional[Dict[str, Any]] = None) -> Dict[
     return eff
 
 # Використовуємо Agg-бекенд для генерації графіків на сервері без GUI
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-from matplotlib.ticker import ScalarFormatter, NullFormatter
+import plotly.graph_objects as go
+import plotly.io as pio
+from plotly.subplots import make_subplots
 import statistics
 import math
 
@@ -108,37 +106,34 @@ def get_period_text(period_str: str) -> str:
 async def generate_statistics_chart(history: List["CheckHistory"], api_name: str, period: str, avg_response_time: float, ucl_hint: Optional[float] = None, overrides: Optional[Dict[str, Any]] = None) -> io.BytesIO:
     """Генерує графік статистики та повертає його як байтовий буфер."""
     if not history:
-        # Створюємо порожній графік з повідомленням, якщо немає даних
-        fig, ax = plt.subplots(figsize=(12, 6.5))
-        ax.text(0.5, 0.5, 'Немає даних для побудови графіка за цей період', 
-                horizontalalignment='center', verticalalignment='center', 
-                transform=ax.transAxes, fontsize=14, color='gray')
+        # Порожнє полотно з повідомленням
+        fig = go.Figure()
+        fig.add_annotation(text='Немає даних для побудови графіка за цей період',
+                           x=0.5, y=0.5, xref='paper', yref='paper', showarrow=False,
+                           font=dict(size=16, color='gray'))
+        fig.update_layout(width=900, height=520, margin=dict(l=50, r=30, t=60, b=60))
         buf = io.BytesIO()
-        plt.savefig(buf, format='png', dpi=100)
+        pio.write_image(fig, buf, format='png', scale=1)
         buf.seek(0)
-        plt.close(fig)
         return buf
 
     timestamps = [h.timestamp for h in history]
-    response_times = [h.response_time_ms if (h.response_time_ms and h.response_time_ms > 0) else 1 for h in history]  # 0 -> 1 для лог шкали
-
+    response_times = [h.response_time_ms if (h.response_time_ms and h.response_time_ms > 0) else 1 for h in history]
     ok_checks = [(h.timestamp, h.response_time_ms) for h in history if h.is_ok and (h.response_time_ms or 0) > 0]
     fail_checks = [(h.timestamp, h.response_time_ms) for h in history if (not h.is_ok) and (h.response_time_ms or 0) > 0]
 
     # Ефективні налаштування (env + runtime overrides)
     eff = _effective_chart_config(overrides)
 
-    # Стиль і розмір графіка з конфігурації
-    try:
-        if eff.get('CHART_STYLE'):
-            plt.style.use(eff.get('CHART_STYLE'))
-    except Exception:
-        plt.style.use('seaborn-v0_8-darkgrid')
+    # Шаблон/тема для Plotly
+    template = 'plotly_dark' if str(eff.get('CHART_STYLE') or '').lower().find('dark') >= 0 else 'plotly_white'
     try:
         w, h = (float(x) for x in (eff.get('CHART_SIZE') or "12x6.5").lower().split('x'))
     except Exception:
         w, h = 12.0, 6.5
-    fig, ax = plt.subplots(figsize=(w, h))
+    width_px = int(w * 75)
+    height_px = int(h * 75)
+    fig = go.Figure()
 
     # Determine UCL (for anomaly highlighting later)
     ucl_value: Optional[float] = None
@@ -195,8 +190,8 @@ async def generate_statistics_chart(history: List["CheckHistory"], api_name: str
         n = len(x)
         if threshold >= n or threshold <= 0:
             return x, y
-        # convert to numeric for area computation
-        xs = [mdates.date2num(ts) for ts in x]
+        # convert to numeric (epoch seconds) for area computation
+        xs = [ts.timestamp() for ts in x]
         bucket_size = (n - 2) / (threshold - 2)
         a = 0  # first point index kept
         sampled_x = [x[0]]
@@ -232,37 +227,54 @@ async def generate_statistics_chart(history: List["CheckHistory"], api_name: str
     if agg_mode == 'per_minute':
         xs, med, p95 = aggregate_per_minute()
         if xs:
-            ax.plot(xs, med, color='dodgerblue', linewidth=1.8, alpha=0.9, label='Медіана (хв)')
-            ax.plot(xs, p95, color='slateblue', linestyle='--', linewidth=1.2, alpha=0.9, label='P95 (хв)')
+            fig.add_trace(go.Scatter(x=xs, y=med, mode='lines', name='Медіана (хв)',
+                                     line=dict(color='dodgerblue', width=1.8)))
+            fig.add_trace(go.Scatter(x=xs, y=p95, mode='lines', name='P95 (хв)',
+                                     line=dict(color='slateblue', width=1.2, dash='dash')))
             subtitle_bits.append('агрегація по хвилинах')
     elif agg_mode == 'lttb':
         target = max(50, int(eff.get('CHART_LTTB_POINTS', 240) or 240))
         xs, ys = lttb(timestamps, response_times, target)
-        ax.plot(xs, ys, color='dodgerblue', linewidth=1.6, alpha=0.85, label=f'LTTB (~{target} тчк)')
+        fig.add_trace(go.Scatter(x=xs, y=ys, mode='lines', name=f'LTTB (~{target} тчк)',
+                                 line=dict(color='dodgerblue', width=1.6)))
         subtitle_bits.append('LTTB даунсемплінг')
     else:
-        # fall back to raw thin line
-        ax.plot(timestamps, response_times, color='dodgerblue', linewidth=1.2, alpha=0.6, label='Час відповіді (мс)')
+        fig.add_trace(go.Scatter(x=timestamps, y=response_times, mode='lines', name='Час відповіді (мс)',
+                                 line=dict(color='dodgerblue', width=1.2)))
 
     # Optional raw line as background for context
     if int(eff.get('CHART_SHOW_RAW_LINE', 1)) and agg_mode != 'none':
-        ax.plot(timestamps, response_times, color='steelblue', linewidth=0.8, alpha=0.25, label='Сирий ряд')
+        fig.add_trace(go.Scatter(
+            x=timestamps, y=response_times, mode='lines', name='Сирий ряд',
+            line=dict(color='steelblue', width=0.8), opacity=0.25, showlegend=False
+        ))
 
     # Failures (always show)
     if fail_checks:
         fail_ts, fail_rt = zip(*fail_checks)
-        ax.scatter(fail_ts, fail_rt, color='crimson', label='Збій', s=58, zorder=5, marker='X', linewidths=1.0, edgecolors='white')
+        fig.add_trace(go.Scatter(x=list(fail_ts), y=list(fail_rt), mode='markers', name='Збій',
+                                 marker=dict(color='crimson', size=8, symbol='x', line=dict(color='white', width=1))))
 
     # Highlight anomalies if configured and UCL known (always show)
     if int(eff.get('CHART_MARK_ANOMALIES', 1)) and ucl_value:
         anoms = [(h.timestamp, h.response_time_ms) for h in history if h.is_ok and (h.response_time_ms or 0) > ucl_value]
         if anoms:
             a_ts, a_rt = zip(*anoms)
-            ax.scatter(a_ts, a_rt, color='orange', edgecolors='white', linewidths=0.7, label='Аномалія', s=70, zorder=6)
+            fig.add_trace(go.Scatter(x=list(a_ts), y=list(a_rt), mode='markers', name='Аномалія',
+                                     marker=dict(color='orange', size=9, line=dict(color='white', width=0.7))))
     
-    # Plot average response time line
+    # Plot average response time line (as a trace so it appears in legend)
     if avg_response_time:
-        ax.axhline(y=avg_response_time, color='darkorange', linestyle='--', linewidth=1.5, label=f'Середній час ({int(avg_response_time)} мс)')
+        try:
+            x0 = timestamps[0]
+            x1 = timestamps[-1]
+            fig.add_trace(go.Scatter(
+                x=[x0, x1], y=[avg_response_time, avg_response_time], mode='lines',
+                name=f'Сер. час ({int(avg_response_time)} мс)',
+                line=dict(color='darkorange', width=1.5, dash='dash'), hoverinfo='skip'
+            ))
+        except Exception:
+            pass
 
     # EWMA лінія (конфігурована)
     if int(eff.get('CHART_SHOW_EWMA', 1)):
@@ -273,14 +285,21 @@ async def generate_statistics_chart(history: List["CheckHistory"], api_name: str
             for v in response_times[1:]:
                 ew = alpha * v + (1 - alpha) * ew
                 ew_series.append(ew)
-            ax.plot(timestamps, ew_series, color='rebeccapurple', linewidth=1.7, alpha=0.8, label=f'EWMA (α={alpha:g})')
+            fig.add_trace(go.Scatter(x=timestamps, y=ew_series, mode='lines', name=f'EWMA (α={alpha:g})',
+                                     line=dict(color='rebeccapurple', width=1.7)))
         except Exception:
             pass
 
-    # UCL лінія (від ML або за історією)
+    # UCL лінія (як трейс для легенди)
     if int(eff.get('CHART_SHOW_UCL', 1)) and ucl_value:
         try:
-            ax.axhline(y=ucl_value, color='crimson', linestyle=':', linewidth=1.6, label=f'UCL (~{int(ucl_value)} мс)')
+            x0 = timestamps[0]
+            x1 = timestamps[-1]
+            fig.add_trace(go.Scatter(
+                x=[x0, x1], y=[ucl_value, ucl_value], mode='lines',
+                name=f'UCL (~{int(ucl_value)} мс)',
+                line=dict(color='crimson', width=1.6, dash='dot'), hoverinfo='skip'
+            ))
         except Exception:
             pass
 
@@ -291,11 +310,10 @@ async def generate_statistics_chart(history: List["CheckHistory"], api_name: str
             if not h.is_ok and down_start is None:
                 down_start = h.timestamp
             if h.is_ok and down_start is not None:
-                ax.axvspan(down_start, h.timestamp, color='lightcoral', alpha=0.12, linewidth=0)
+                fig.add_vrect(x0=down_start, x1=h.timestamp, fillcolor='lightcoral', opacity=0.12, line_width=0)
                 down_start = None
-        # If ended in down state
         if down_start is not None:
-            ax.axvspan(down_start, timestamps[-1], color='lightcoral', alpha=0.12, linewidth=0)
+            fig.add_vrect(x0=down_start, x1=timestamps[-1], fillcolor='lightcoral', opacity=0.12, line_width=0)
     except Exception:
         pass
 
@@ -308,9 +326,9 @@ async def generate_statistics_chart(history: List["CheckHistory"], api_name: str
             for p in pts:
                 pi = int(p)
                 if 0 < pi < 100 and vals:
-                    # simple quantile via statistics.quantiles
                     q = quantiles(vals, n=100)[pi-1]
-                    ax.axhline(y=q, color='gray', linestyle='--', linewidth=0.8, alpha=0.6, label=f'P{pi}≈{int(q)} мс')
+                    fig.add_hline(y=q, line_color='gray', line_dash='dash', line_width=0.8,
+                                  annotation_text=f'P{pi}≈{int(q)} мс', annotation_position='top left')
     except Exception:
         pass
 
@@ -318,48 +336,33 @@ async def generate_statistics_chart(history: List["CheckHistory"], api_name: str
     subtitle = get_period_text(period)
     if subtitle_bits:
         subtitle += " · " + ", ".join(subtitle_bits)
-    ax.set_title(f"Статистика відповіді для '{api_name}'\n за {subtitle}", fontsize=16, pad=20)
-    ax.set_xlabel("Час", fontsize=12)
-    ax.set_ylabel("Час відповіді (мс)", fontsize=12)
-    ax.legend(loc='upper left', frameon=True, framealpha=0.9)
+
     yscale = (str(eff.get('CHART_Y_SCALE') or 'log')).lower()
-    if yscale == 'auto':
-        # Якщо діапазон вузький — linear, інакше log
-        try:
-            mn, mx = min(response_times), max(response_times)
-            ax.set_yscale('linear' if mx <= 0 or (mx - mn) < 100 else 'log')
-        except Exception:
-            ax.set_yscale('log')
-    else:
-        ax.set_yscale(yscale if yscale in {'log','linear'} else 'log')
-    
-    # --- ПОКРАЩЕННЯ ---
-    # Використовуємо звичайні числа замість степенів для осі Y
-    ax.yaxis.set_major_formatter(ScalarFormatter())
-    ax.yaxis.set_minor_formatter(NullFormatter())
-    ax.tick_params(axis='y', which='minor', bottom=False)
-    # Додаємо більше ліній сітки для кращої читабельності
-    ax.grid(True, which='major', linestyle='--', linewidth=0.5)
-    ax.grid(True, which='minor', linestyle=':', linewidth=0.3)
-    # Softer spines for a cleaner look
-    for spine in ['top', 'right']:
-        ax.spines[spine].set_visible(False)
-    # --- КІНЕЦЬ ПОКРАЩЕНЬ ---
+    y_type = 'log' if (yscale == 'log' or (yscale == 'auto' and (max(response_times) - min(response_times)) >= 100 and max(response_times) > 0)) else 'linear'
 
-    # Format x-axis dates
-    date_format = mdates.DateFormatter('%H:%M\n%d-%m')
-    ax.xaxis.set_major_formatter(date_format)
-    fig.autofmt_xdate(rotation=0, ha='center')
+    # Legend styling (below chart). Adjust background for better readability.
+    is_dark = (template == 'plotly_dark')
+    legend_bg = 'rgba(0,0,0,0.35)' if is_dark else 'rgba(255,255,255,0.75)'
+    legend_border = '#444' if is_dark else '#dddddd'
+    fig.update_layout(
+        template=template,
+        title=f"Статистика відповіді для '{api_name}'\n за {subtitle}",
+        width=width_px,
+        height=height_px,
+        margin=dict(l=60, r=30, t=70, b=90),
+    legend=dict(
+            orientation='h', yanchor='top', y=-0.18, xanchor='left', x=0,
+            bgcolor=legend_bg, bordercolor=legend_border, borderwidth=1, font=dict(size=11)
+    ),
+    legend_traceorder='normal'
+    )
+    fig.update_xaxes(title_text='Час')
+    fig.update_yaxes(title_text='Час відповіді (мс)', type=y_type)
 
-    fig.tight_layout(pad=2.0)
-    
-    # Save to buffer
     buf = io.BytesIO()
-    dpi = int(eff.get('CHART_DPI', 120) or 120)
-    plt.savefig(buf, format='png', dpi=dpi)
+    scale = max(1, int((eff.get('CHART_DPI', 120) or 120) / 96))
+    pio.write_image(fig, buf, format='png', scale=scale)
     buf.seek(0)
-    plt.close(fig)
-    
     return buf
 
 def _safe_pct(x: float) -> float:
@@ -367,6 +370,90 @@ def _safe_pct(x: float) -> float:
         return float(x)
     except Exception:
         return 0.0
+
+async def generate_daily_overview_chart(items: List[Dict[str, Any]], overrides: Optional[Dict[str, Any]] = None) -> io.BytesIO:
+    """Створює оглядовий графік за 24h для всіх моніторів.
+    Очікує список словників із ключами: name, avg_ms, uptime, downtime_min, incidents, anomalies.
+    Повертає PNG у BytesIO.
+    """
+    eff = _effective_chart_config(overrides)
+    # Тема
+    template = 'plotly_dark' if str(eff.get('CHART_STYLE') or '').lower().find('dark') >= 0 else 'plotly_white'
+    # Розміри: висота залежить від кількості рядків
+    try:
+        w, _ = (float(x) for x in (eff.get('CHART_SIZE') or "12x6.5").lower().split('x'))
+    except Exception:
+        w = 12.0
+    width_px = int(w * 75)
+    n = max(1, len(items))
+    height_px = max(420, int(120 + n * 30))
+
+    if not items:
+        fig = go.Figure()
+        fig.add_annotation(text='Немає активних моніторів для щоденного звіту', x=0.5, y=0.5,
+                           xref='paper', yref='paper', showarrow=False,
+                           font=dict(size=16, color='gray'))
+        fig.update_layout(width=width_px, height=height_px, template=template)
+        buf = io.BytesIO()
+        pio.write_image(fig, buf, format='png', scale=max(1, int((eff.get('CHART_DPI', 120) or 120)/96)))
+        buf.seek(0)
+        return buf
+
+    # Сортуємо за середнім часом відповіді (спадання)
+    items_sorted = sorted(items, key=lambda x: (x.get('avg_ms') or 0), reverse=True)
+    # Додаємо бейджі UP/DOWN до імен
+    names = [f"{'🟢' if bool(it.get('is_up', True)) else '🔴'} {str(it.get('name'))}" for it in items_sorted]
+    avg_ms = [int(it.get('avg_ms') or 0) for it in items_sorted]
+    uptime = [float(it.get('uptime') or 0.0) for it in items_sorted]
+    down_min = [int(it.get('downtime_min') or 0) for it in items_sorted]
+    incs = [int(it.get('incidents') or 0) for it in items_sorted]
+    anos = [int(it.get('anomalies') or 0) for it in items_sorted]
+
+    from plotly.subplots import make_subplots
+    fig = make_subplots(rows=1, cols=3, shared_yaxes=True, horizontal_spacing=0.1,
+                        subplot_titles=("Сер. час відповіді (мс)", "Простій (хв)", "Інциденти (шт)"))
+
+    # Бар для середнього часу відповіді
+    fig.add_trace(
+        go.Bar(x=avg_ms, y=names, orientation='h', name='Avg RT',
+               marker=dict(color=uptime, colorscale='RdYlGn', cmin=0, cmax=100, showscale=False),
+               text=[f"{u:.1f}% · інц {i} · ан {a}" for u,i,a in zip(uptime, incs, anos)],
+               textposition='auto'),
+        row=1, col=1
+    )
+
+    # Бар для простою (хвилини)
+    fig.add_trace(
+        go.Bar(x=down_min, y=names, orientation='h', name='Downtime', marker_color='indianred',
+               text=[str(v) if v>0 else '' for v in down_min], textposition='auto'),
+        row=1, col=2
+    )
+
+    # Степ-бар для кількості інцидентів
+    fig.add_trace(
+        go.Bar(x=incs, y=names, orientation='h', name='Incidents', marker_color='darkorange',
+               text=[str(v) if v>0 else '' for v in incs], textposition='auto'),
+        row=1, col=3
+    )
+
+    fig.update_layout(
+        template=template,
+        width=width_px,
+        height=height_px,
+        margin=dict(l=160, r=40, t=80, b=40),
+        showlegend=False,
+        title="Огляд моніторів · 24h"
+    )
+    fig.update_xaxes(title_text='мс', row=1, col=1)
+    fig.update_xaxes(title_text='хв', row=1, col=2)
+    fig.update_xaxes(title_text='шт', row=1, col=3)
+    fig.update_yaxes(autorange='reversed')
+
+    buf = io.BytesIO()
+    scale = max(1, int((eff.get('CHART_DPI', 120) or 120)/96))
+    pio.write_image(fig, buf, format='png', scale=scale)
+    buf.seek(0)
+    return buf
 
 def generate_conclusion(stats: dict, ml: Optional[Dict[str, Any]], anom: Optional[Dict[str, Any]]) -> str:
     """Генерує короткий висновок зрозумілою мовою."""

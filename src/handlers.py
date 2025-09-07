@@ -18,7 +18,7 @@ from database import (add_api_to_db, get_all_apis, get_api_by_id,  # type: ignor
                       update_api_fields, set_api_mute, set_anomaly_alerts, is_chat_subscribed,  # type: ignore
                       get_anomaly_stats_for_period, set_anomaly_params,  # type: ignore
                       is_chat_anomaly_notifications_enabled, set_chat_anomaly_notifications)  # type: ignore
-from scheduler import add_job_to_scheduler, remove_job_from_scheduler, check_api
+from scheduler import add_job_to_scheduler, remove_job_from_scheduler, check_api, send_daily_summary
 from utils import (format_api_status, parse_add_command, format_statistics_report,  # type: ignore
                    generate_statistics_chart)  # type: ignore
 from runtime_config import get_chart_overrides, set_chart_option, get_effective_chart_config_sync
@@ -376,6 +376,16 @@ async def cmd_server_status(message: Message):
         health_line = "⚠️ Сервіс (metrics) недоступний"
     text = await format_server_status(health_line)
     await message.answer(text)
+
+@router.message(AdminFilter(), Command("daily"))
+async def cmd_daily_now(message: Message):
+    if not await _guard_message_access(message):
+        return
+    try:
+        await send_daily_summary(cast(Bot, message.bot))
+        await message.answer("✅ Денний звіт надіслано.")
+    except Exception as e:
+        await message.answer(f"Помилка надсилання: {e}")
 
 @router.callback_query(F.data == "metrics_health")
 async def cb_metrics_health(call: CallbackQuery):
@@ -937,6 +947,8 @@ def build_chart_kb(ov: dict[str, Any]) -> InlineKeyboardMarkup:
     eff: dict[str, Any] = get_effective_chart_config_sync(ov)
     ag = str(eff.get('CHART_AGGREGATION') or 'per_minute').lower()
     ys = str(eff.get('CHART_Y_SCALE') or 'log').lower()
+    style = str(eff.get('CHART_STYLE') or '').lower()
+    is_dark = ('dark' in style) or (style == '' and True)
 
     def as_bool(name: str, default: int) -> bool:
         try:
@@ -964,6 +976,10 @@ def build_chart_kb(ov: dict[str, Any]) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text=mark("Auto", ys == 'auto'), callback_data="chart:CHART_Y_SCALE:auto"),
         ],
         [
+            InlineKeyboardButton(text=mark("Dark", is_dark), callback_data="chart:CHART_STYLE:plotly_dark"),
+            InlineKeyboardButton(text=mark("Light", not is_dark), callback_data="chart:CHART_STYLE:plotly_white"),
+        ],
+        [
             InlineKeyboardButton(text=mark("Raw ON", raw_on), callback_data="chart:CHART_SHOW_RAW_LINE:1"),
             InlineKeyboardButton(text=mark("Raw OFF", not raw_on), callback_data="chart:CHART_SHOW_RAW_LINE:0"),
         ],
@@ -985,6 +1001,29 @@ def build_chart_kb(ov: dict[str, Any]) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="⬅️ Меню", callback_data="menu"),
         ],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def build_stats_quick_kb(api_id: int, period: str, ov: dict[str, Any]) -> InlineKeyboardMarkup:
+    eff: dict[str, Any] = get_effective_chart_config_sync(ov)
+    ys = str(eff.get('CHART_Y_SCALE') or 'log').lower()
+    style = str(eff.get('CHART_STYLE') or '').lower()
+    is_dark = ('dark' in style) or (style == '' and True)
+
+    def mark(txt: str, cond: bool) -> str:
+        return ("✅ " + txt) if cond else txt
+
+    kb = [
+        [
+            InlineKeyboardButton(text=mark("Log", ys == 'log'), callback_data=f"chartq:{api_id}:{period}:CHART_Y_SCALE:log"),
+            InlineKeyboardButton(text=mark("Linear", ys == 'linear'), callback_data=f"chartq:{api_id}:{period}:CHART_Y_SCALE:linear"),
+            InlineKeyboardButton(text=mark("Auto", ys == 'auto'), callback_data=f"chartq:{api_id}:{period}:CHART_Y_SCALE:auto"),
+        ],
+        [
+            InlineKeyboardButton(text=mark("Dark", is_dark), callback_data=f"chartq:{api_id}:{period}:CHART_STYLE:plotly_dark"),
+            InlineKeyboardButton(text=mark("Light", not is_dark), callback_data=f"chartq:{api_id}:{period}:CHART_STYLE:plotly_white"),
+        ],
+        [InlineKeyboardButton(text="⚙️ Меню графіків", callback_data="chart_menu")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
@@ -1128,7 +1167,8 @@ async def cmd_stats(message: Message):
     
     await message.reply_photo(
         photo=BufferedInputFile(chart_buffer.read(), filename=f"stats_{api_id}_{period}.png"),
-        caption=report_caption
+    caption=report_caption,
+    reply_markup=build_stats_quick_kb(api_id, period, chart_overrides)
     )
 
 @router.message(AdminFilter(), Command("chart"))
@@ -1383,10 +1423,82 @@ async def cb_stats(call: CallbackQuery):
     caption = format_statistics_report(api_name, stats_data, ml_part, anom_stats)
     msg = getattr(call, 'message', None)
     if msg is not None:
-        await msg.reply_photo(photo=BufferedInputFile(chart_buffer.read(), filename=f"stats_{api_id}_{period}.png"), caption=caption)
+        await msg.reply_photo(
+            photo=BufferedInputFile(chart_buffer.read(), filename=f"stats_{api_id}_{period}.png"),
+            caption=caption,
+            reply_markup=build_stats_quick_kb(api_id, period, chart_overrides)
+        )
     else:
         await call.answer("Графік доступний у чаті з ботом.", show_alert=True)
     await call.answer()
+
+@router.callback_query(F.data.startswith("chartq:"))
+async def cb_chart_quick(call: CallbackQuery):
+    if not await _guard_callback_access(call):
+        return
+    # Expected: chartq:<api_id>:<period>:<KEY>:<VALUE>
+    try:
+        _, id_str, period, key, value = (call.data or '').split(":", 4)
+        api_id = int(id_str)
+    except Exception:
+        await call.answer("Невірні дані", show_alert=True)
+        return
+    # Persist option
+    try:
+        await set_chart_option(key, value)
+    except ValueError as e:
+        await call.answer(str(e), show_alert=True)
+        return
+
+    api = await get_api_by_id(api_id)
+    if not api:
+        await call.answer("API не знайдено", show_alert=True)
+        return
+
+    # Recompute with new overrides
+    stats_data = cast(dict[str, Any], await get_stats_for_period(api_id, period))
+    if not stats_data:
+        await call.answer(f"Некоректний період: {period}", show_alert=True)
+        return
+    history_data = await get_history_for_period(api_id, period)
+    ml_metric = await get_latest_ml_metric(api_id)
+    anom_stats = cast(dict[str, Any], await get_anomaly_stats_for_period(api_id, period))
+    chart_overrides = await get_chart_overrides()
+    ucl_hint: Optional[float] = None
+    if ml_metric is not None and getattr(ml_metric, 'ucl_ms', None) is not None:
+        try:
+            ucl_hint = float(getattr(ml_metric, 'ucl_ms'))
+        except Exception:
+            ucl_hint = None
+    avg_rt = float(stats_data.get("avg_response_time_ms", 0) or 0)
+    api_name = str(getattr(api, 'name', api_id))
+    chart_buffer = await generate_statistics_chart(
+        history_data, api_name, period, avg_rt, ucl_hint, chart_overrides
+    )
+    ml_part = None
+    if ml_metric:
+        ml_part = {
+            "median_ms": ml_metric.median_ms,
+            "mad_ms": ml_metric.mad_ms,
+            "ewma_ms": ml_metric.ewma_ms,
+            "ucl_ms": ml_metric.ucl_ms,
+            "window": ml_metric.window_size,
+        }
+    caption = format_statistics_report(api_name, stats_data, ml_part, anom_stats)
+    msg = getattr(call, 'message', None)
+    if msg is not None:
+        await msg.reply_photo(
+            photo=BufferedInputFile(chart_buffer.read(), filename=f"stats_{api_id}_{period}.png"),
+            caption=caption,
+            reply_markup=build_stats_quick_kb(api_id, period, chart_overrides)
+        )
+    else:
+        await call.answer("Графік доступний у чаті з ботом.", show_alert=True)
+        return
+    try:
+        await call.answer("Збережено")
+    except Exception:
+        pass
 
 @router.callback_query(F.data.startswith("pause:"))
 async def cb_pause(call: CallbackQuery, scheduler: AsyncIOScheduler):

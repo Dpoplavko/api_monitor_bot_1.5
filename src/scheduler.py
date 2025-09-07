@@ -9,6 +9,7 @@ import time
 import json
 
 from aiogram import Bot
+from aiogram.types import BufferedInputFile
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
@@ -17,8 +18,9 @@ from database import (MonitoredAPI, update_api_status, get_api_by_id,
                       log_check_to_history, create_incident, end_incident, get_all_active_apis, get_stats_for_period,
                       get_recent_history_points, save_ml_metric, get_latest_ml_metric, log_anomaly_event, get_last_anomaly_time,
                       get_subscribers_for_api, get_or_create_notification_state, update_down_reminder_time, purge_old_data,
-                      is_chat_anomaly_notifications_enabled)
-from utils import format_api_status, format_timedelta, robust_stats, detect_anomaly
+                      is_chat_anomaly_notifications_enabled, get_anomaly_stats_for_period)
+from utils import format_api_status, format_timedelta, robust_stats, detect_anomaly, generate_daily_overview_chart
+from runtime_config import get_chart_overrides
 from metrics import CHECKS_TOTAL, CHECKS_FAIL, INCIDENTS_TOTAL, ANOMALIES_TOTAL, RESPONSE_TIME_MS, ML_MEDIAN_MS, ML_MAD_MS, ML_UCL_MS, ML_P95_MS
 
 logger = logging.getLogger(__name__)
@@ -234,38 +236,92 @@ async def check_api(bot: Bot, api_id: int):
     await update_api_status(api.id, update_data)
 
 async def send_daily_summary(bot: Bot):
-    """Надсилає щоденний звіт по всім активним моніторам."""
+    """Надсилає щоденний звіт: оглядовий графік по всіх моніторах + стислий підсумок."""
     logger.info("Починаю формування щоденного звіту...")
     active_apis = await get_all_active_apis()
     if not active_apis:
         logger.info("Немає активних моніторів для щоденного звіту.")
         return
 
-    summary_header = f"☀️ <b>Щоденний звіт за {datetime.date.today().strftime('%d-%m-%Y')}</b>\n\n"
-    summary_parts = []
-
+    # Збираємо метрики 24h для кожного монітора
+    items: list[dict] = []
+    total_incidents = 0
+    total_anoms = 0
+    total_downtime_min = 0
+    current_down = 0
     for api in active_apis:
-        status_icon = "🟢" if api.is_up else "🔴"
         stats = await get_stats_for_period(api.id, "24h")
-        
-        part = (
-            f"<b>{status_icon} {api.name}</b> (ID: {api.id})\n"
-            f"  - Аптайм: {stats.get('uptime_percent', 100):.2f}%\n"
-            f"  - Падінь: {stats.get('incident_count', 0)}\n"
-            f"  - Час простою: {format_timedelta(stats.get('total_downtime', datetime.timedelta()))}\n"
-            f"  - Сер. відповідь: {int(stats.get('avg_response_time_ms') or 0)} мс\n"
-        )
-        summary_parts.append(part)
+        an = await get_anomaly_stats_for_period(api.id, "24h")
+        up = float(stats.get('uptime_percent', 100.0) or 0.0)
+        avg_ms = int(stats.get('avg_response_time_ms') or 0)
+        inc = int(stats.get('incident_count') or 0)
+        td = stats.get('total_downtime') or datetime.timedelta()
+        down_min = int(td.total_seconds() // 60)
+        an_cnt = int((an or {}).get('count') or 0)
+        items.append({
+            'name': api.name,
+            'is_up': bool(getattr(api, 'is_up', True)),
+            'avg_ms': avg_ms,
+            'uptime': up,
+            'downtime_min': down_min,
+            'incidents': inc,
+            'anomalies': an_cnt,
+        })
+        total_incidents += inc
+        total_anoms += an_cnt
+        total_downtime_min += down_min
+        if not bool(getattr(api, 'is_up', True)):
+            current_down += 1
 
-    full_summary = summary_header + "\n".join(summary_parts)
-    
+    # Формуємо короткий підсумок
+    today = datetime.date.today().strftime('%d-%m-%Y')
+    n = len(items)
+    avg_uptime = sum(it['uptime'] for it in items) / max(1, n)
+    # Топи
+    slowest = sorted(items, key=lambda x: x['avg_ms'], reverse=True)[:3]
+    most_downtime = sorted(items, key=lambda x: x['downtime_min'], reverse=True)[:3]
+    most_anoms = sorted(items, key=lambda x: x['anomalies'], reverse=True)[:3]
+    def _fmt_top(arr):
+        return ", ".join([f"{i['name']} ({i['avg_ms']}мс)" for i in arr]) or '—'
+    def _fmt_down(arr):
+        return ", ".join([f"{i['name']} ({i['downtime_min']}хв)" for i in arr]) or '—'
+    def _fmt_an(arr):
+        return ", ".join([f"{i['name']} ({i['anomalies']})" for i in arr]) or '—'
+
+    text = (
+        f"☀️ <b>Щоденний звіт</b> · {today}\n\n"
+        f"Моніторів: <b>{n}</b> · Зараз DOWN: <b>{current_down}</b> · Середній аптайм: <b>{avg_uptime:.2f}%</b>\n"
+        f"Інцидентів: <b>{total_incidents}</b> · Аномалій: <b>{total_anoms}</b> · Простою сумарно: <b>{total_downtime_min} хв</b>\n\n"
+        f"🏁 Топ повільних (Avg RT): { _fmt_top(slowest) }\n"
+        f"⏱️ Топ за простоєм: { _fmt_down(most_downtime) }\n"
+        f"⚠️ Топ за аномаліями: { _fmt_an(most_anoms) }"
+    )
+
+    # Генеруємо оглядовий графік (бар-чарти)
     try:
-        # Розсилка всім глобальним підписникам (та адміну)
-        try:
-            for chat_id in await get_subscribers_for_api(0):
-                await bot.send_message(chat_id, full_summary)
-        except Exception:
-            await bot.send_message(bot.config.ADMIN_USER_ID, full_summary)
+        overrides = await get_chart_overrides()
+    except Exception:
+        overrides = None
+    try:
+        chart_buf = await generate_daily_overview_chart(items, overrides)
+    except Exception as e:
+        logger.warning(f"Не вдалося згенерувати оглядовий графік: {e}")
+        chart_buf = None
+
+    # Розсилка всім глобальним підписникам (та адміну)
+    try:
+        recipients = await get_subscribers_for_api(0)
+        if not recipients:
+            recipients = [bot.config.ADMIN_USER_ID]
+        for chat_id in recipients:
+            if chart_buf is not None:
+                try:
+                    img = BufferedInputFile(chart_buf.getvalue(), filename=f"daily_overview_{today}.png")
+                    await bot.send_photo(chat_id, photo=img, caption=text)
+                except Exception:
+                    await bot.send_message(chat_id, text)
+            else:
+                await bot.send_message(chat_id, text)
         logger.info("Щоденний звіт успішно надіслано.")
     except Exception as e:
         logger.error(f"Не вдалося надіслати щоденний звіт: {e}")
