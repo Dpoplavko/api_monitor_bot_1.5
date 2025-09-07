@@ -6,7 +6,7 @@ import logging
 from typing import AsyncGenerator, List, Optional, Tuple, Dict
 
 from sqlalchemy import (Column, Integer, String, DateTime, Boolean, JSON,
-                        create_engine, select, func, ForeignKey, Index)
+                        create_engine, select, func, ForeignKey, Index, text)
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship
 
@@ -49,6 +49,14 @@ class MonitoredAPI(Base):
     consecutive_successes = Column(Integer, default=0)
     incident_start_time = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    # New controls
+    notifications_muted = Column(Boolean, default=False)
+    mute_until = Column(DateTime, nullable=True)
+    anomaly_alerts_enabled = Column(Boolean, default=True)
+    # ML params (per-API)
+    anomaly_m = Column(Integer, default=int(settings.ANOMALY_M))
+    anomaly_n = Column(Integer, default=int(settings.ANOMALY_N))
+    anomaly_sensitivity = Column(String, default=str(settings.ANOMALY_SENSITIVITY))  # store as string, cast to float when reading
 
 class CheckHistory(Base):
     __tablename__ = "check_history"
@@ -113,6 +121,45 @@ class AppConfig(Base):
 async def init_db():
     async with async_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    await ensure_schema()
+    # SQLite pragmatic tuning
+    if not IS_POSTGRES:
+        try:
+            async with async_engine.begin() as conn:
+                await conn.execute(text("PRAGMA journal_mode=WAL"))
+                await conn.execute(text("PRAGMA synchronous=NORMAL"))
+        except Exception as e:
+            logger.warning(f"SQLite PRAGMA setup failed: {e}")
+
+async def ensure_schema():
+    """Ensure new columns exist for backward compatibility without Alembic."""
+    try:
+        async with async_engine.begin() as conn:
+            if not IS_POSTGRES:
+                # SQLite: check pragma and add columns if missing
+                cols = await conn.execute(text("PRAGMA table_info(monitored_apis)"))
+                colnames = [row[1] for row in cols]
+                if 'notifications_muted' not in colnames:
+                    await conn.execute(text("ALTER TABLE monitored_apis ADD COLUMN notifications_muted BOOLEAN DEFAULT 0"))
+                if 'mute_until' not in colnames:
+                    await conn.execute(text("ALTER TABLE monitored_apis ADD COLUMN mute_until DATETIME"))
+                if 'anomaly_alerts_enabled' not in colnames:
+                    await conn.execute(text("ALTER TABLE monitored_apis ADD COLUMN anomaly_alerts_enabled BOOLEAN DEFAULT 1"))
+                if 'anomaly_m' not in colnames:
+                    await conn.execute(text(f"ALTER TABLE monitored_apis ADD COLUMN anomaly_m INTEGER DEFAULT {int(settings.ANOMALY_M)}"))
+                if 'anomaly_n' not in colnames:
+                    await conn.execute(text(f"ALTER TABLE monitored_apis ADD COLUMN anomaly_n INTEGER DEFAULT {int(settings.ANOMALY_N)}"))
+                if 'anomaly_sensitivity' not in colnames:
+                    await conn.execute(text(f"ALTER TABLE monitored_apis ADD COLUMN anomaly_sensitivity TEXT DEFAULT '{str(settings.ANOMALY_SENSITIVITY)}'"))
+            else:
+                await conn.execute(text("ALTER TABLE monitored_apis ADD COLUMN IF NOT EXISTS notifications_muted BOOLEAN DEFAULT FALSE"))
+                await conn.execute(text("ALTER TABLE monitored_apis ADD COLUMN IF NOT EXISTS mute_until TIMESTAMP NULL"))
+                await conn.execute(text("ALTER TABLE monitored_apis ADD COLUMN IF NOT EXISTS anomaly_alerts_enabled BOOLEAN DEFAULT TRUE"))
+                await conn.execute(text(f"ALTER TABLE monitored_apis ADD COLUMN IF NOT EXISTS anomaly_m INTEGER DEFAULT {int(settings.ANOMALY_M)}"))
+                await conn.execute(text(f"ALTER TABLE monitored_apis ADD COLUMN IF NOT EXISTS anomaly_n INTEGER DEFAULT {int(settings.ANOMALY_N)}"))
+                await conn.execute(text(f"ALTER TABLE monitored_apis ADD COLUMN IF NOT EXISTS anomaly_sensitivity TEXT DEFAULT '{str(settings.ANOMALY_SENSITIVITY)}'"))
+    except Exception as e:
+        logger.warning(f"Schema ensure skipped/failed: {e}")
 
 async def add_api_to_db(data: dict) -> MonitoredAPI:
     async with AsyncSessionFactory() as session:
@@ -141,6 +188,59 @@ async def update_api_status(api_id: int, update_data: dict):
             for key, value in update_data.items():
                 setattr(api, key, value)
             await session.commit()
+
+async def update_api_fields(api_id: int, fields: dict) -> Optional[MonitoredAPI]:
+    """Generic update for editable fields of MonitoredAPI."""
+    allowed = {
+        'name','url','method','headers','request_body','expected_status','timeout','check_interval','json_keys',
+        'notifications_muted','mute_until','anomaly_alerts_enabled','is_active'
+    }
+    async with AsyncSessionFactory() as session:
+        api = await session.get(MonitoredAPI, api_id)
+        if not api:
+            return None
+        for k, v in fields.items():
+            if k in allowed:
+                setattr(api, k, v)
+        await session.commit()
+        await session.refresh(api)
+        return api
+
+async def set_api_mute(api_id: int, muted: bool, mute_until: Optional[datetime.datetime] = None) -> Optional[MonitoredAPI]:
+    async with AsyncSessionFactory() as session:
+        api = await session.get(MonitoredAPI, api_id)
+        if not api:
+            return None
+        api.notifications_muted = bool(muted)
+        api.mute_until = mute_until
+        await session.commit()
+        await session.refresh(api)
+        return api
+
+async def set_anomaly_alerts(api_id: int, enabled: bool) -> Optional[MonitoredAPI]:
+    async with AsyncSessionFactory() as session:
+        api = await session.get(MonitoredAPI, api_id)
+        if not api:
+            return None
+        api.anomaly_alerts_enabled = bool(enabled)
+        await session.commit()
+        await session.refresh(api)
+        return api
+
+async def set_anomaly_params(api_id: int, m: int | None = None, n: int | None = None, sensitivity: float | None = None) -> Optional[MonitoredAPI]:
+    async with AsyncSessionFactory() as session:
+        api = await session.get(MonitoredAPI, api_id)
+        if not api:
+            return None
+        if m is not None:
+            api.anomaly_m = int(m)
+        if n is not None:
+            api.anomaly_n = int(n)
+        if sensitivity is not None:
+            api.anomaly_sensitivity = str(float(sensitivity))
+        await session.commit()
+        await session.refresh(api)
+        return api
 
 async def toggle_api_monitoring(api_id: int, is_active: bool) -> Optional[MonitoredAPI]:
     async with AsyncSessionFactory() as session:
@@ -231,6 +331,16 @@ async def get_stats_for_period(api_id: int, period: str) -> dict:
         "incident_count": incident_count, "total_downtime": total_downtime, "avg_downtime": avg_downtime,
     }
 
+async def get_anomaly_stats_for_period(api_id: int, period: str) -> dict:
+    start_date = parse_period_to_timedelta(period)
+    if not start_date: return {"count": 0}
+    async with AsyncSessionFactory() as session:
+        stmt = select(func.count(AnomalyEvent.id)).where(AnomalyEvent.api_id == api_id, AnomalyEvent.timestamp >= start_date)
+        count = (await session.execute(stmt)).scalar() or 0
+        last_stmt = select(AnomalyEvent).where(AnomalyEvent.api_id == api_id, AnomalyEvent.timestamp >= start_date).order_by(AnomalyEvent.timestamp.desc()).limit(1)
+        last = (await session.execute(last_stmt)).scalars().first()
+    return {"count": int(count), "last_at": (last.timestamp if last else None)}
+
 # --- ML helpers ---
 async def get_recent_history_points(api_id: int, limit: int = 200) -> List[CheckHistory]:
     async with AsyncSessionFactory() as session:
@@ -300,6 +410,44 @@ async def get_subscribers_for_api(api_id: int) -> List[int]:
         result = set(globals_list + api_list + [int(settings.ADMIN_USER_ID)])
         return list(result)
 
+async def get_all_subscribed_chats() -> List[int]:
+    """Return unique list of all chats subscribed either globally or to any API."""
+    async with AsyncSessionFactory() as session:
+        rows = await session.execute(text("SELECT DISTINCT chat_id FROM subscriptions"))
+        return [int(r[0]) for r in rows]
+
+# Per-chat anomaly notification flag via AppConfig
+async def set_chat_anomaly_notifications(chat_id: int, enabled: bool) -> None:
+    key = f"chat:{int(chat_id)}:anom_notify"
+    await set_config_value(key, "1" if enabled else "0")
+
+async def is_chat_anomaly_notifications_enabled(chat_id: int) -> bool:
+    key = f"chat:{int(chat_id)}:anom_notify"
+    val = await get_config_value(key)
+    return not (val is not None and str(val).strip() in {"0", "false", "no", "off"})
+
+# Version announcement tracking via AppConfig
+async def mark_version_announced(chat_id: int, version: str) -> None:
+    key = f"ver_sent:{version}:{int(chat_id)}"
+    await set_config_value(key, "1")
+
+async def was_version_announced(chat_id: int, version: str) -> bool:
+    key = f"ver_sent:{version}:{int(chat_id)}"
+    val = await get_config_value(key)
+    return val is not None
+
+async def is_chat_subscribed(chat_id: int, api_id: Optional[int]) -> bool:
+    """Check if chat is subscribed either globally (api_id is None) or to a specific api_id."""
+    async with AsyncSessionFactory() as session:
+        # Specific subscription
+        if api_id is not None:
+            stmt = select(Subscription).where(Subscription.chat_id == chat_id, Subscription.api_id == api_id)
+            if (await session.execute(stmt)).scalars().first():
+                return True
+        # Global subscription
+        stmt = select(Subscription).where(Subscription.chat_id == chat_id, Subscription.api_id.is_(None))
+        return (await session.execute(stmt)).scalars().first() is not None
+
 async def get_or_create_notification_state(api_id: int) -> NotificationState:
     async with AsyncSessionFactory() as session:
         stmt = select(NotificationState).where(NotificationState.api_id == api_id)
@@ -342,3 +490,23 @@ async def get_all_config() -> Dict[str, str]:
     async with AsyncSessionFactory() as session:
         rows = (await session.execute(select(AppConfig))).scalars().all()
         return {r.key: r.value for r in rows}
+
+async def purge_old_data(retention_days: int) -> None:
+    """Remove old history and incidents beyond retention window."""
+    cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=max(1, retention_days))
+    async with AsyncSessionFactory() as session:
+        try:
+            await session.execute(
+                select(CheckHistory).where(CheckHistory.timestamp < cutoff)
+            )  # dry select to ensure table exists
+        except Exception:
+            return
+    # Use raw SQL for efficiency
+    try:
+        async with async_engine.begin() as conn:
+            await conn.execute(text("DELETE FROM check_history WHERE timestamp < :cutoff"), {"cutoff": cutoff})
+            await conn.execute(text("DELETE FROM incidents WHERE end_time IS NOT NULL AND end_time < :cutoff"), {"cutoff": cutoff})
+            if not IS_POSTGRES:
+                await conn.execute(text("VACUUM"))
+    except Exception as e:
+        logger.warning(f"Retention purge failed: {e}")

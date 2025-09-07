@@ -32,11 +32,11 @@ import math
 
 # --- ML/stat helpers ---
 def robust_stats(values: List[int]) -> Dict[str, float]:
-    """Обчислює медіану, MAD, EWMA та верхню контрольну межу (UCL ~ медіана + 3*MAD).
-    Повертає dict із median, mad, ewma, ucl.
+    """Обчислює медіану, MAD, EWMA, P95 та верхню контрольну межу (UCL ~ медіана + 3*MAD).
+    Повертає dict із median, mad, ewma, p95, ucl.
     """
     if not values:
-        return {"median": 0.0, "mad": 0.0, "ewma": 0.0, "ucl": 0.0}
+        return {"median": 0.0, "mad": 0.0, "ewma": 0.0, "p95": 0.0, "ucl": 0.0}
     med = float(statistics.median(values))
     abs_dev = [abs(v - med) for v in values]
     mad = float(statistics.median(abs_dev)) or 0.0
@@ -47,7 +47,17 @@ def robust_stats(values: List[int]) -> Dict[str, float]:
         ewma = alpha * v + (1 - alpha) * ewma
     # UCL: медіана + 3 * 1.4826 * MAD (прибл. еквівалент std для нормального розподілу)
     ucl = med + 3.0 * 1.4826 * mad
-    return {"median": med, "mad": mad, "ewma": ewma, "ucl": ucl}
+    # P95
+    try:
+        vs = sorted(values)
+        if vs:
+            idx = min(len(vs)-1, max(0, int(math.ceil(0.95 * len(vs)) - 1)))
+            p95 = float(vs[idx])
+        else:
+            p95 = 0.0
+    except Exception:
+        p95 = 0.0
+    return {"median": med, "mad": mad, "ewma": ewma, "p95": p95, "ucl": ucl}
 
 def detect_anomaly(value: int, ucl: float) -> Tuple[bool, float]:
     """Проста детекція: спрацьовує, якщо значення > UCL. score = (value - ucl)."""
@@ -142,8 +152,19 @@ async def generate_statistics_chart(history: List["CheckHistory"], api_name: str
     except Exception:
         ucl_value = None
 
-    # Aggregation and downsampling strategy
-    agg_mode = (str(eff.get('CHART_AGGREGATION') or 'per_minute')).lower()
+    # Aggregation and downsampling strategy (supports 'auto')
+    agg_mode_cfg = (str(eff.get('CHART_AGGREGATION') or 'per_minute')).lower()
+    agg_mode = agg_mode_cfg
+    if agg_mode_cfg == 'auto':
+        # Heuristic: <=24h -> per_minute, else lttb
+        per = period.lower().strip()
+        try:
+            if per.endswith('h') and int(per[:-1]) <= 24:
+                agg_mode = 'per_minute'
+            else:
+                agg_mode = 'lttb'
+        except Exception:
+            agg_mode = 'per_minute'
 
     # Helper: per-minute aggregation (median and P95 of successful checks)
     def aggregate_per_minute() -> Tuple[List[datetime.datetime], List[float], List[float]]:
@@ -263,6 +284,21 @@ async def generate_statistics_chart(history: List["CheckHistory"], api_name: str
         except Exception:
             pass
 
+    # Shade downtime intervals derived from history (consecutive is_ok=False)
+    try:
+        down_start = None
+        for h in history:
+            if not h.is_ok and down_start is None:
+                down_start = h.timestamp
+            if h.is_ok and down_start is not None:
+                ax.axvspan(down_start, h.timestamp, color='lightcoral', alpha=0.12, linewidth=0)
+                down_start = None
+        # If ended in down state
+        if down_start is not None:
+            ax.axvspan(down_start, timestamps[-1], color='lightcoral', alpha=0.12, linewidth=0)
+    except Exception:
+        pass
+
     # Перцентилі
     try:
         pct_cfg = str(eff.get('CHART_SHOW_PERCENTILES') or "").strip()
@@ -326,7 +362,30 @@ async def generate_statistics_chart(history: List["CheckHistory"], api_name: str
     
     return buf
 
-def format_statistics_report(api_name: str, stats: dict, ml: Optional[Dict[str, Any]] = None) -> str:
+def _safe_pct(x: float) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return 0.0
+
+def generate_conclusion(stats: dict, ml: Optional[Dict[str, Any]], anom: Optional[Dict[str, Any]]) -> str:
+    """Генерує короткий висновок зрозумілою мовою."""
+    uptime = _safe_pct(stats.get('uptime_percent', 100.0))
+    avg_rt = int(stats.get('avg_response_time_ms') or 0)
+    an_cnt = int((anom or {}).get('count') or 0)
+    ml_med = int((ml or {}).get('median_ms') or 0)
+    ml_ew = int((ml or {}).get('ewma_ms') or 0)
+    drift = ml_ew - ml_med
+    # Просте дерево рішень
+    if uptime < 98.0 or an_cnt > 10:
+        return "Сервіс має суттєві проблеми стабільності. Рекомендуємо перевірити інфраструктуру та залежності."
+    if uptime < 99.0 or an_cnt > 5 or drift > max(100, ml_med * 0.3):
+        return "Помітні ознаки деградації продуктивності. Варто звернути увагу на навантаження та бази даних."
+    if avg_rt > max(500, ml_med * 1.5) or an_cnt > 0:
+        return "Періодично спостерігаються сплески часу відповіді. Ситуація під контролем, але варто моніторити."
+    return "Стан стабільний: аптайм високий, продуктивність у нормі."
+
+def format_statistics_report(api_name: str, stats: dict, ml: Optional[Dict[str, Any]] = None, anom: Optional[Dict[str, Any]] = None) -> str:
     """Форматує словник зі статистикою в повідомлення для Telegram. Додає ML-аналітику, якщо є."""
     period_text = get_period_text(stats['period'])
 
@@ -338,6 +397,8 @@ def format_statistics_report(api_name: str, stats: dict, ml: Optional[Dict[str, 
         f"  - <b>Загальний час простою:</b> {format_timedelta(stats['total_downtime'])}\n"
         f"  - <b>Середня тривалість падіння:</b> {format_timedelta(stats['avg_downtime'])}"
     )
+    if anom:
+        report += f"\n  - <b>Аномалій (ML):</b> {int(anom.get('count') or 0)}"
     if ml:
         report += (
             "\n\n🧠 <b>ML-аналітика</b>\n"
@@ -347,6 +408,8 @@ def format_statistics_report(api_name: str, stats: dict, ml: Optional[Dict[str, 
             f"  - UCL (~поріг): {int(ml.get('ucl_ms') or 0)} мс\n"
             f"  - Вікно: {int(ml.get('window') or 0)}"
         )
+    # Висновок
+    report += "\n\n<b>Висновок:</b> " + generate_conclusion(stats, ml, anom)
     return report
 
 def parse_add_command(text: str) -> Dict:

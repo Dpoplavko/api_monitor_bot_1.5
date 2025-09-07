@@ -29,11 +29,21 @@ class Settings:
     ML_WINDOW: int = 200
     ML_COMPUTE_INTERVAL_MINUTES: int = 10
     ANOMALY_COOLDOWN_MINUTES: int = 30
+    # ML detection tuning
+    ANOMALY_M: int = 3
+    ANOMALY_N: int = 5
+    ANOMALY_SENSITIVITY: float = 1.5  # multiplier for threshold (higher => less sensitive)
+    ANOMALY_PCT_FACTOR: float = 1.0   # factor for percentile threshold
+    ANOMALY_ERROR_RATE_THRESHOLD: float = 0.1  # 10% failures considered elevated
     # Quiet hours & reminders
     QUIET_HOURS_ENABLED: int = 0
     QUIET_START_HOUR: int = 22
     QUIET_END_HOUR: int = 8
     DOWNTIME_REMINDER_MINUTES: int = 60
+    # Data retention
+    RETENTION_DAYS: int = 90
+    # Metrics/health
+    METRICS_PORT: int = 8080
     # Charts / visualization
     CHART_STYLE: str | None = None
     CHART_Y_SCALE: str = "log"  # log|linear|auto
@@ -87,12 +97,19 @@ settings = Settings(
     ML_WINDOW=int(os.getenv("ML_WINDOW", "200")),
     ML_COMPUTE_INTERVAL_MINUTES=int(os.getenv("ML_COMPUTE_INTERVAL_MINUTES", "10")),
     ANOMALY_COOLDOWN_MINUTES=int(os.getenv("ANOMALY_COOLDOWN_MINUTES", "30")),
+    ANOMALY_M=int(os.getenv("ANOMALY_M", "3")),
+    ANOMALY_N=int(os.getenv("ANOMALY_N", "5")),
+    ANOMALY_SENSITIVITY=float(os.getenv("ANOMALY_SENSITIVITY", "1.5")),
+    ANOMALY_PCT_FACTOR=float(os.getenv("ANOMALY_PCT_FACTOR", "1.0")),
+    ANOMALY_ERROR_RATE_THRESHOLD=float(os.getenv("ANOMALY_ERROR_RATE_THRESHOLD", "0.1")),
     QUIET_HOURS_ENABLED=(
         1 if str(os.getenv("QUIET_HOURS_ENABLED", "0")).strip().lower() in {"1","true","yes","y","on","t"} else 0
     ),
     QUIET_START_HOUR=int(os.getenv("QUIET_START_HOUR", "22")),
     QUIET_END_HOUR=int(os.getenv("QUIET_END_HOUR", "8")),
     DOWNTIME_REMINDER_MINUTES=int(os.getenv("DOWNTIME_REMINDER_MINUTES", "60")),
+    RETENTION_DAYS=int(os.getenv("RETENTION_DAYS", "90")),
+    METRICS_PORT=int(os.getenv("METRICS_PORT", "8080")),
     CHART_STYLE=os.getenv("CHART_STYLE", "seaborn-v0_8-darkgrid"),
     CHART_Y_SCALE=os.getenv("CHART_Y_SCALE", "log"),
     CHART_SHOW_UCL=(1 if str(os.getenv("CHART_SHOW_UCL", "1")).strip().lower() in {"1","true","yes","y","on","t"} else 0),

@@ -8,5 +8,6 @@ sqlalchemy==2.0.30
 aiosqlite==0.20.0
 python-dotenv==1.0.1
 matplotlib==3.8.4
+prometheus-client==0.20.0
 # Додайте наступний рядок, якщо плануєте використовувати PostgreSQL
 # asyncpg==0.29.0

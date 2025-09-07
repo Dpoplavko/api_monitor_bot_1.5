@@ -16,8 +16,10 @@ from config import settings
 from database import (MonitoredAPI, update_api_status, get_api_by_id, 
                       log_check_to_history, create_incident, end_incident, get_all_active_apis, get_stats_for_period,
                       get_recent_history_points, save_ml_metric, get_latest_ml_metric, log_anomaly_event, get_last_anomaly_time,
-                      get_subscribers_for_api, get_or_create_notification_state, update_down_reminder_time)
+                      get_subscribers_for_api, get_or_create_notification_state, update_down_reminder_time, purge_old_data,
+                      is_chat_anomaly_notifications_enabled)
 from utils import format_api_status, format_timedelta, robust_stats, detect_anomaly
+from metrics import CHECKS_TOTAL, CHECKS_FAIL, INCIDENTS_TOTAL, ANOMALIES_TOTAL, RESPONSE_TIME_MS, ML_MEDIAN_MS, ML_MAD_MS, ML_UCL_MS, ML_P95_MS
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +32,15 @@ async def check_api(bot: Bot, api_id: int):
         return
 
     start_time = time.monotonic()
+    now_dt = datetime.datetime.utcnow()
+    # Refresh mute state (auto-unmute on expiry)
+    if api.notifications_muted and api.mute_until and api.mute_until <= now_dt:
+        try:
+            await update_api_status(api.id, {"notifications_muted": False, "mute_until": None})
+            api.notifications_muted = False
+            api.mute_until = None
+        except Exception:
+            pass
     is_currently_ok = False
     response_time_ms = -1
     status_code = None
@@ -74,6 +85,14 @@ async def check_api(bot: Bot, api_id: int):
         logger.warning(f"ПЕРЕВІРКА НЕВДАЛА: API '{api.name}' (ID: {api.id}): {error_str}")
 
     await log_check_to_history(api_id, is_currently_ok, response_time_ms, status_code)
+    try:
+        CHECKS_TOTAL.labels(api_id=str(api_id)).inc()
+        if not is_currently_ok:
+            CHECKS_FAIL.labels(api_id=str(api_id)).inc()
+        if response_time_ms >= 0:
+            RESPONSE_TIME_MS.labels(api_id=str(api_id)).observe(response_time_ms)
+    except Exception:
+        pass
     
     update_data = {
         "last_checked": datetime.datetime.utcnow(),
@@ -86,27 +105,69 @@ async def check_api(bot: Bot, api_id: int):
     if settings.ML_ENABLED and response_time_ms >= 0 and is_currently_ok:
         try:
             latest_metrics = await get_latest_ml_metric(api_id)
-            if latest_metrics and latest_metrics.ucl_ms:
-                is_anom, score = detect_anomaly(response_time_ms, latest_metrics.ucl_ms)
+            if latest_metrics and latest_metrics.ucl_ms and getattr(api, 'anomaly_alerts_enabled', True):
+                # sensitivity-adjusted threshold + percentile factor
+                try:
+                    sens = float(getattr(api, 'anomaly_sensitivity', settings.ANOMALY_SENSITIVITY) or settings.ANOMALY_SENSITIVITY)
+                except Exception:
+                    sens = float(settings.ANOMALY_SENSITIVITY)
+                base_thr = float(latest_metrics.ucl_ms) * sens
+                thr = base_thr
+                try:
+                    recent = await get_recent_history_points(api_id, limit=50)
+                    vals = [int(h.response_time_ms) for h in recent if h.response_time_ms and h.response_time_ms > 0]
+                    loc = robust_stats(vals)
+                    p_thr = float(loc.get('p95', 0) or 0) * float(settings.ANOMALY_PCT_FACTOR)
+                    thr = max(base_thr, p_thr)
+                except Exception:
+                    pass
+                is_anom, score = detect_anomaly(response_time_ms, thr)
                 if is_anom:
-                    # Перевіряємо cooldown, щоб не спамити
+                    # m-of-n rule to suppress one-offs
+                    try:
+                        m = int(getattr(api, 'anomaly_m', settings.ANOMALY_M) or settings.ANOMALY_M)
+                        n = int(getattr(api, 'anomaly_n', settings.ANOMALY_N) or settings.ANOMALY_N)
+                    except Exception:
+                        m, n = settings.ANOMALY_M, settings.ANOMALY_N
+                    last_n = await get_recent_history_points(api_id, limit=max(n, 1))
+                    over = 0
+                    for h in last_n:
+                        try:
+                            if h.response_time_ms and int(h.response_time_ms) > thr:
+                                over += 1
+                        except Exception:
+                            pass
+                    if over < m:
+                        raise Exception("m-of-n suppression")
+                    # Перевіряємо cooldown, щоб не спамити (scaled)
                     last_ts = await get_last_anomaly_time(api_id)
                     too_soon = False
                     if last_ts:
                         delta = datetime.datetime.utcnow() - last_ts
-                        too_soon = delta.total_seconds() < settings.ANOMALY_COOLDOWN_MINUTES * 60
+                        over_ratio = (response_time_ms - thr) / max(1.0, thr)
+                        scale = 0.5 if over_ratio > 0.5 else (0.75 if over_ratio > 0.25 else 1.0)
+                        too_soon = delta.total_seconds() < settings.ANOMALY_COOLDOWN_MINUTES * 60 * scale
                     if not too_soon:
                         await log_anomaly_event(api_id, response_time_ms, score, reason="rt>UCL")
                         text_warn = (
                             f"⚠️ <b>ПОПЕРЕДЖЕННЯ (аномалія): {api.name}</b>\n\n"
-                            f"Час відповіді {response_time_ms} мс перевищив поріг UCL ~ {latest_metrics.ucl_ms} мс.\n"
+                            f"Час відповіді {response_time_ms} мс перевищив поріг ~ {int(thr)} мс.\n"
                             f"Це може свідчити про деградацію продуктивності."
                         )
-                        try:
-                            for chat_id in await get_subscribers_for_api(api.id):
-                                await bot.send_message(chat_id, text_warn)
-                        except Exception:
-                            pass
+                        # Respect mute
+                        muted = bool(getattr(api, 'notifications_muted', False)) and (api.mute_until is None or api.mute_until > now_dt)
+                        if not muted:
+                            try:
+                                for chat_id in await get_subscribers_for_api(api.id):
+                                    # Respect per-chat anomaly notifications toggle
+                                    try:
+                                        if not await is_chat_anomaly_notifications_enabled(int(chat_id)):
+                                            continue
+                                    except Exception:
+                                        pass
+                                    await bot.send_message(chat_id, text_warn)
+                            except Exception:
+                                pass
         except Exception as _:
             # Не ламаємо основний потік
             pass
@@ -135,11 +196,14 @@ async def check_api(bot: Bot, api_id: int):
                 f"  - Невдалих перевірок: {api.consecutive_failures}"
             )
             # Сповіщення усім підписникам
-            try:
-                for chat_id in await get_subscribers_for_api(api.id):
-                    await bot.send_message(chat_id, recovery_message)
-            except Exception:
-                pass
+            # Respect mute for recovery
+            muted = bool(getattr(api, 'notifications_muted', False)) and (api.mute_until is None or api.mute_until > now_dt)
+            if not muted:
+                try:
+                    for chat_id in await get_subscribers_for_api(api.id):
+                        await bot.send_message(chat_id, recovery_message)
+                except Exception:
+                    pass
             update_data["incident_start_time"] = None
         
     else: # Невдала перевірка
@@ -152,14 +216,20 @@ async def check_api(bot: Bot, api_id: int):
             # Час початку інциденту - це час першої невдалої перевірки
             update_data["incident_start_time"] = datetime.datetime.utcnow() - datetime.timedelta(seconds=api.check_interval * (update_data["consecutive_failures"] - 1))
             await create_incident(api.id, update_data["incident_start_time"])
-            
-            # Сповіщення усім підписникам
-            text_down = f"🔴 <b>ПАДІННЯ: {api.name}</b>\n\n{format_api_status(api, update_data)}"
             try:
-                for chat_id in await get_subscribers_for_api(api.id):
-                    await bot.send_message(chat_id=chat_id, text=text_down)
+                INCIDENTS_TOTAL.labels(api_id=str(api.id)).inc()
             except Exception:
                 pass
+            
+            # Сповіщення усім підписникам (з урахуванням mute)
+            text_down = f"🔴 <b>ПАДІННЯ: {api.name}</b>\n\n{format_api_status(api, update_data)}"
+            muted = bool(getattr(api, 'notifications_muted', False)) and (api.mute_until is None or api.mute_until > now_dt)
+            if not muted:
+                try:
+                    for chat_id in await get_subscribers_for_api(api.id):
+                        await bot.send_message(chat_id=chat_id, text=text_down)
+                except Exception:
+                    pass
 
     await update_api_status(api.id, update_data)
 
@@ -230,6 +300,21 @@ async def setup_scheduler(scheduler: AsyncIOScheduler, bot: Bot):
     scheduler.add_job(send_daily_summary, 'cron', hour=report_hour, minute=report_minute, args=[bot], timezone=tz_name)
     logger.info(f"Додано завдання для щоденної розсилки о {report_hour:02d}:{report_minute:02d} ({tz_name}).")
 
+    # Щоденне прибирання старих даних за політикою ретеншну
+    try:
+        retention_days = int(getattr(settings, 'RETENTION_DAYS', 30) or 30)
+        async def retention_job():
+            try:
+                await purge_old_data(retention_days)
+                logger.info("Retention purge completed")
+            except Exception as e:
+                logger.warning(f"Retention purge failed: {e}")
+        # Запуск щодня о 03:30 UTC
+        scheduler.add_job(retention_job, 'cron', hour=3, minute=30, timezone='UTC', id='retention_purge', replace_existing=True)
+        logger.info(f"Додано завдання очищення старих даних (ретеншн {retention_days} дн.) о 03:30 UTC")
+    except Exception as e:
+        logger.warning(f"Не вдалося налаштувати ретеншн: {e}")
+
     # Додаємо періодичний перерахунок ML метрик
     if settings.ML_ENABLED:
         interval_sec = max(60, int(settings.ML_COMPUTE_INTERVAL_MINUTES) * 60)
@@ -249,6 +334,14 @@ async def setup_scheduler(scheduler: AsyncIOScheduler, bot: Bot):
                         "ucl_ms": int(metrics.get("ucl", 0) or 0),
                     }
                     await save_ml_metric(api.id, payload)
+                    # export gauges
+                    try:
+                        ML_MEDIAN_MS.labels(api_id=str(api.id)).set(float(payload["median_ms"]))
+                        ML_MAD_MS.labels(api_id=str(api.id)).set(float(payload["mad_ms"]))
+                        ML_UCL_MS.labels(api_id=str(api.id)).set(float(payload["ucl_ms"]))
+                        ML_P95_MS.labels(api_id=str(api.id)).set(float(metrics.get("p95", 0) or 0))
+                    except Exception:
+                        pass
                 logger.info("ML-метрики оновлено.")
             except Exception as e:
                 logger.error(f"Помилка ML-обчислень: {e}")
@@ -263,6 +356,10 @@ async def setup_scheduler(scheduler: AsyncIOScheduler, bot: Bot):
             now = datetime.datetime.utcnow()
             for api in apis:
                 if not api.is_up and api.incident_start_time:
+                    # Skip reminders if muted
+                    muted = bool(getattr(api, 'notifications_muted', False)) and (api.mute_until is None or api.mute_until > now)
+                    if muted:
+                        continue
                     state = await get_or_create_notification_state(api.id)
                     need = False
                     if not state.last_down_reminder_at:
