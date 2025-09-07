@@ -177,7 +177,7 @@ async def process_full_body_and_save(message: Message, state: FSMContext, bot: B
     await state.clear()
     await message.answer(f"✅ API '<b>{api.name}</b>' (ID: {api.id}) успішно додано.")
 
-@router.message(AdminFilter(), Command("stats"))
+@router.message(Command("stats"))
 async def cmd_stats(message: Message):
     parts = message.text.split()
     if len(parts) < 2:
