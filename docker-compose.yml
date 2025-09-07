@@ -6,6 +6,11 @@ services:
     env_file:
       - .env
     environment:
-      - TZ=${TZ:-UTC}
+      TZ: ${TZ:-UTC}
     volumes:
-      - ./data:/app/data
+      - api_monitor_bot_data:/app/data
+
+volumes:
+  api_monitor_bot_data:
+
+
